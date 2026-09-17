@@ -15,7 +15,7 @@ bindings = [
 [vars]
 # PYIP: PROXYIP 回退代理地址，直连失败时通过此 IP 中转
 # PYIP = "[2602:fc59:b0:64::6810:0]"
-PYIP = "proxyip.us.cmliussss.net"
+PYIP = "proxyip.us.cmliussss.net:443"
 # UUID4: VLESS 协议的 userId，没有设置就使用代码内置的 uuid
 UUID4 = "d87484d1-77a6-40bb-bac6-5b574bd7f61c"
 # REGION: 放置 Durable Objects 区域，可选值：wnam, enam, sam, weur, eeur, apac, oc, afr, me
