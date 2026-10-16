@@ -16,8 +16,11 @@ bindings = [
 # PYIP: PROXYIP 回退代理地址，直连失败时通过此 IP 中转
 # PYIP = "[2602:fc59:b0:64::6810:0]"
 PYIP = "proxyip.us.cmliussss.net:443"
-# UUID4: VLESS 协议的 userId，没有设置就使用代码内置的 uuid
+# UUID4: 节点协议的 userId，没有设置就使用代码内置的 uuid
 UUID4 = "d87484d1-77a6-40bb-bac6-5b574bd7f61c"
 # REGION: 放置 Durable Objects 区域，可选值：wnam, enam, sam, weur, eeur, apac, oc, afr, me
 # 第一次部署创建 DO 时决定位置，之后修改无效
 REGION = "wnam"
+# DO_SHARDS: DO 分片数。1 = 所有连接共用一个实例（出口 IP 最稳、duration 计费最省）
+# >1 = 每条连接随机挑一个分片，并发连接摊到多个实例；注意 duration 额度按实例数成倍消耗
+DO_SHARDS = "1"

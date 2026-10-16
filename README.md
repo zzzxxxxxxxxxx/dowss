@@ -30,6 +30,8 @@ wrangler deploy
 | PYIP   | PROXYIP 回退代理地址，直连失败时通过此 IP 中转。端口由目标地址决定，此处只需填 IP |
 | UUID4  | vless协议的userId                                            |
 | REGION | DO 放置区域，第一次部署实例化才生效，可选：wnam/enam/sam/weur/eeur/apac/oc/afr/me |
+| DO_SHARDS | DO 分片数，默认 `1`。`1` 时所有连接共用一个实例（出口 IP 最稳、duration 计费最省）；`>1` 时每条连接随机挑一个分片，把并发连接摊到多个实例上——各分片仍在同一区域，但不同连接可能落在不同实例。注意：分片数会成倍消耗 DO duration 额度；从 `1` 改成 `>1`（或改回来）会换用新的实例名 |
+| TCP_CONCURRENT_DIAL | 直连并发拨号数，默认 `2`：同时发起多路 TCP 建连，取最先建立的一条，用来吃掉 CF 路由层的抖动。设为 `1` 关闭竞速（每请求并发出站连接有配额，Snippets 形态建议设 `1`） |
 
 ## 三、注意：
 
@@ -76,3 +78,52 @@ const id = env.WS_DO.jurisdiction("fedramp").idFromName(name);
 开始使用是比较慢的，慢慢会提升速度，如果用了很久，速度还是没有提升，就是DO放置的位置不合适。特别是多次更改位置部署的，很大概率变慢的。
 
 ### 4、部署位置可参考： [link](https://where.durableobjects.live/)
+
+### 5、TCP 出站用的是 request 级 fetcher
+
+代码不 `import { connect } from "cloudflare:sockets"`，而是用 `request.fetcher.connect()`——这是 GrainTCP 引入的
+request 级灰接口，未见于官方 API 文档。运行时会给每个入口请求挂上这个 fetcher，DO 里同样有（本地 e2e 已实测：
+下行 4MB、上行 16MB 字节一致，重试链连 PYIP 也正常）。这样做的收益是源码里少一个明显的特征串。
+
+万一哪天部署后报 `request.fetcher.connect unavailable`，说明运行时不再提供这个接口：
+把 `dialWithTimeout()` 里的 `fetcher.connect({ hostname, port })` 换回
+`import { connect } from "cloudflare:sockets"` 的 `connect({ hostname, port })`，并把 `dialFastest` / `handleTCPOutBound`
+上多出来的 `fetcher` 参数一起去掉即可。
+
+## 四、回归测试
+
+隧道数据路径（上行合包、下行 BYOB 大包直发与小包聚合、切代理时重放、下行世代隔离）有一份 Node 挂具：
+
+```
+node test/tunnel.test.mjs
+```
+
+不需要 wrangler、不需要部署。它用桩顶替 `cloudflare:sockets` 与 `cloudflare:workers`，直接在 Node 里跑 `src/index.js`，
+用假 socket 喂数据验证字节顺序、合包次数和重放完整性。改了 `src/index.js` 的数据路径后先跑这个再部署。
+
+### 本地端到端（wrangler dev + xray-core）
+
+需要本机有 `wrangler`、`xray`、`python3`、`curl`。开三个终端：
+
+```
+# 1) 本地 worker（DO 与变量都用 wrangler.toml 里的值）
+wrangler dev --port 8787 --ip 127.0.0.1
+
+# 2) 测试源站：GET /payload 返回 4MB 随机数据，POST /echo 回显 body 的 sha256
+python3 test/e2e/origin.py 18000
+
+# 3) xray 客户端：SOCKS 127.0.0.1:10808 → VLESS/WS → 本地 worker（已开 early data）
+xray run -c test/e2e/xray-client.json
+```
+
+然后比对直连与过隧道的哈希，三者必须一致：
+
+```
+curl -sS -o /tmp/d.bin http://127.0.0.1:18000/payload && sha256sum /tmp/d.bin
+curl -sS --socks5-hostname 127.0.0.1:10808 -o /tmp/p.bin http://127.0.0.1:18000/payload && sha256sum /tmp/p.bin
+curl -sS -X POST --socks5-hostname 127.0.0.1:10808 --data-binary @<任意文件> http://127.0.0.1:18000/echo
+```
+
+想验重试链（直连不回包 → 切 PYIP → 重放）就再起 `python3 test/e2e/silent.py`，
+访问 `http://127.0.0.1:18001/`，worker 日志里应出现 `no data within 3500ms, triggering retry` 与 `retry N/3 via proxy ...`，
+且全程没有 ERROR。

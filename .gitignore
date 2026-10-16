@@ -1,0 +1,8 @@
+# wrangler 本地状态（wrangler dev / deploy 生成）
+.wrangler/
+
+# 依赖
+node_modules/
+
+# 日志
+*.log
