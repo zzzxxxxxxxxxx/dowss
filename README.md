@@ -21,6 +21,9 @@ wrangler deploy
 
 - 其他部署途径，没有尝试过。
 
+- 必须是 Workers 形态：本项目依赖 Durable Object 绑定，因此不能作为 Cloudflare Snippets 运行
+  （Snippets 是 zone 级的 Rules 功能，没有绑定机制，执行时限也只有 5ms）。
+
 ## 二、修改变量
 
 可以先部署，再到CF后台修改**变量和机密**。也可以部署前找到 `wrangler.toml` 里面 `[vars]` 字段，修改里面的字段值。
@@ -31,7 +34,7 @@ wrangler deploy
 | UUID4  | vless协议的userId                                            |
 | REGION | DO 放置区域，第一次部署实例化才生效，可选：wnam/enam/sam/weur/eeur/apac/oc/afr/me |
 | DO_SHARDS | DO 分片数，默认 `1`。`1` 时所有连接共用一个实例（出口 IP 最稳、duration 计费最省）；`>1` 时每条连接随机挑一个分片，把并发连接摊到多个实例上——各分片仍在同一区域，但不同连接可能落在不同实例。注意：分片数会成倍消耗 DO duration 额度；从 `1` 改成 `>1`（或改回来）会换用新的实例名 |
-| TCP_CONCURRENT_DIAL | 直连并发拨号数，默认 `2`：同时发起多路 TCP 建连，取最先建立的一条，用来吃掉 CF 路由层的抖动。设为 `1` 关闭竞速（每请求并发出站连接有配额，Snippets 形态建议设 `1`） |
+| TCP_CONCURRENT_DIAL | 直连并发拨号数，默认 `2`：同时发起多路 TCP 建连，取最先建立的一条，用来吃掉 CF 路由层的抖动。设为 `1` 可关闭竞速（每请求的同时打开连接数有配额，2 路只占其中一部分，默认值是安全的；调大则要留意这个配额） |
 
 ## 三、注意：
 
