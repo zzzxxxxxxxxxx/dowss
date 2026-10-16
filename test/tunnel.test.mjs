@@ -107,7 +107,7 @@ async function openTunnel(env = {}) {
 
 let passed = 0;
 
-// ================= T1 响应头提前发 + 直连并发拨号 =================
+// ================= T1 响应头随首条下行数据发出 + 直连并发拨号 =================
 {
 	const sockets = installStub();
 	const { serverSide } = await openTunnel();
@@ -118,12 +118,14 @@ let passed = 0;
 	assert.deepEqual(globalThis.__socketStub.calls[0], { hostname: '1.1.1.1', port: 443 });
 	const winner = sockets.find((x) => !x.s.isClosed());
 	assert.ok(winner, 'T1: 应有一条连接胜出');
-	assert.deepEqual([...serverSide.sent[0]], [0, 0], 'T1: 响应头应单独、先于任何数据发出');
+	// 关键不变式：没有下行数据之前不能发响应头，否则会与 101 握手竞态（early data 场景下真实丢帧）
+	assert.equal(serverSide.sent.length, 0, 'T1: 首条下行数据之前不应发响应头');
 	assert.equal(winner.s.content(), 'HELLO', 'T1: 首包载荷应写入胜出连接');
-	// 让远端回一次包，取消首字节超时定时器：否则它会在后续用例期间触发重试并污染 socket 计数
+	// 让远端回一次包：既是首条下行数据，也顺便取消首字节超时定时器
 	winner.s.push(new Uint8Array([1]));
 	await tick(20);
-	console.log('T1 响应头提前单独发送；直连 2 路竞速，载荷写入胜出连接');
+	assert.deepEqual([...serverSide.sent[0]], [0, 0], 'T1: 响应头应随首条下行数据先发');
+	console.log('T1 响应头随首条下行数据发出（避开 101 竞态）；直连 2 路竞速，载荷写入胜出连接');
 	passed++;
 }
 
@@ -158,7 +160,6 @@ let passed = 0;
 	serverSide.emit('message', { data: buildPacket('HELLO') });
 	await tick(60);
 	const winner = sockets.find((x) => !x.s.isClosed());
-	const headerCount = serverSide.sent.length;
 
 	const downlink = [];
 	for (let i = 0; i < 40; i++) {
@@ -168,7 +169,9 @@ let passed = 0;
 	}
 	await tick(80);
 
-	const downlinkSends = serverSide.sent.slice(headerCount).map(toText);
+	// sent[0] 是随首条下行数据发出的 2 字节响应头，之后才是数据
+	assert.deepEqual([...serverSide.sent[0]], [0, 0], 'T3: 响应头应在首条下行数据前发出');
+	const downlinkSends = serverSide.sent.slice(1).map(toText);
 	assert.ok(downlinkSends.length < 40, `T3: 40 条 256B 小包应被聚合，实际发了 ${downlinkSends.length} 次`);
 	assert.equal(downlinkSends.join(''), downlink.join(''), 'T3: 聚合后内容与顺序必须完全一致');
 

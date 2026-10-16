@@ -489,7 +489,7 @@ async function dialFastest(fetcher, host, port, attempts, log) {
 
 /* ---------- 建立 TCP 连接（或走代理） ---------- */
 async function handleTCPOutBound(headerInfo, io) {
-	const { proxyInfo, ws, log, fetcher, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, markConfirmed } = io;
+	const { proxyInfo, ws, log, fetcher, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, onFirstDownlink } = io;
 
 	// 在串行链内建连并挂载；挂载会把未确认数据标成待重发，随后由排空循环写到新连接上
 	async function dialAndAttach(host, port, attempts) {
@@ -501,6 +501,11 @@ async function handleTCPOutBound(headerInfo, io) {
 		});
 	}
 
+	// 只有当前世代的连接才有资格补响应头、标记确认；旧 socket 迟到的数据一律忽略
+	const firstDownlinkOf = (guard) => () => {
+		if (guard()) onFirstDownlink();
+	};
+
 	// 代理重试：直连握手失败、或直连后首字节超时，都走 ProxyIP，最多 3 次
 	let retryRemaining = 3;
 	async function retry() {
@@ -510,8 +515,9 @@ async function handleTCPOutBound(headerInfo, io) {
 		try {
 			const tcp = await dialAndAttach(proxyInfo.hostname, headerInfo?.portRemote, 1);
 			drainUplink();
+			const guard = makeDownlinkGuard();
 			// 还有剩余重试次数则继续传递 retry，否则传 null 停止重试
-			relayDownlink(tcp, ws, retryRemaining > 0 ? retry : null, log, makeDownlinkGuard(), markConfirmed);
+			relayDownlink(tcp, ws, retryRemaining > 0 ? retry : null, log, guard, firstDownlinkOf(guard));
 		} catch (err) {
 			// 代理 TCP 握手也失败，继续尝试下一次重试
 			log(`proxy connect failed: ${err.message}, retries left: ${retryRemaining}`);
@@ -525,7 +531,8 @@ async function handleTCPOutBound(headerInfo, io) {
 		const tcp = await dialAndAttach(headerInfo?.addressRemote, headerInfo?.portRemote, dialAttempts);
 		drainUplink();
 		// 2、再把读写流桥接（直连无数据时触发 retry）
-		relayDownlink(tcp, ws, retry, log, makeDownlinkGuard(), markConfirmed);
+		const guard = makeDownlinkGuard();
+		relayDownlink(tcp, ws, retry, log, guard, firstDownlinkOf(guard));
 	} catch (err) {
 		// 直连 TCP 握手失败（SYN 被封锁等），直接走代理重试
 		log(`direct connect failed: ${err.message}, retrying via proxy`);
@@ -800,6 +807,24 @@ export class WsDo extends DurableObject {
 			return () => downlinkGen === gen && serverSide.readyState === WS_READY_STATE_OPEN;
 		};
 
+		// 响应头不在解析首包时发。开了 early data 的客户端，首包是在 makeReadableWebSocketStream
+		// 的 start() 里就被喂进管道的，那次写入可能早于 DO 的 101 送达客户端，这一帧在真实边缘有概率
+		// 被丢掉（客户端就会把第一个载荷字节当成版本号读）。改成第一条下行数据到达时随流发出：
+		// 那时客户端的请求已经在 WS 上跑过，握手必然已经完成。
+		let responseHeader = null;
+		let responseHeaderSent = false;
+		const sendResponseHeaderOnce = () => {
+			if (responseHeaderSent || !responseHeader) return;
+			responseHeaderSent = true;
+			if (serverSide.readyState === WS_READY_STATE_OPEN) serverSide.send(responseHeader);
+		};
+
+		// 远端回包说明这条连接可用：先补响应头，再释放重放数据
+		const onFirstDownlink = () => {
+			sendResponseHeaderOnce();
+			markConfirmed();
+		};
+
 		const io = {
 			proxyInfo,
 			ws: serverSide,
@@ -810,7 +835,7 @@ export class WsDo extends DurableObject {
 			attachSocket,
 			drainUplink,
 			makeDownlinkGuard,
-			markConfirmed,
+			onFirstDownlink,
 		};
 
 		// ---------- 把 inbound 流 pipe 到处理函数 ----------
@@ -852,9 +877,9 @@ export class WsDo extends DurableObject {
 							}
 						}
 
-						// ----- TCP：响应头单独先发，省掉首包拼接的拷贝、也让首字节更早 -----
-						// 只有 UDP 分支由 handleUDPOutBound 自己带响应头，这里不能重复发
-						if (serverSide.readyState === WS_READY_STATE_OPEN) serverSide.send(headerInfo.responseHeader);
+						// ----- TCP：响应头留到第一条下行数据时再发（原因见 sendResponseHeaderOnce 的注释）-----
+						// UDP 分支由 handleUDPOutBound 自己带响应头，不走这里
+						responseHeader = headerInfo.responseHeader;
 
 						// 首包之后的数据进合包队列，直连失败/超时切代理时会被重发
 						recordUplink(headerInfo?.rawClientData);
