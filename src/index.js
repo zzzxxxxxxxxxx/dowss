@@ -627,6 +627,8 @@ export class WsDo extends DurableObject {
 		this.uuid4 = env.UUID4 ?? DEFAULT_UUID;
 		this.userIDUint8Array = userIdToUint8Array(this.uuid4);
 		this.dialAttempts = Math.max(1, Number(env.TCP_CONCURRENT_DIAL) || CONCURRENT_DIALS);
+		// 实例创建是「首次访问慢」的一个候选原因：和同一个请求的 fetch 日志对时间戳就能看出来
+		console.log(`[do] instance constructed ${new Date().toISOString()}`);
 	}
 
 	/**
@@ -656,10 +658,11 @@ export class WsDo extends DurableObject {
 		// allowHalfOpen：一端结束时不要连带关掉另一端，隧道两端的结束时机常常不一致
 		try { serverSide.accept({ allowHalfOpen: true }); } catch (_) { serverSide.accept(); }
 
-		// 日志统一函数，便于在 DO 里打印
+		// 日志统一函数：带「距本次 fetch 进入」的相对毫秒，方便把首次连接的分段耗时看成一整条时间线
+		const fetchStartedAt = Date.now();
 		let address = "";
 		let portLog = "";
-		const log = (msg, data) => console.log(`[${address}${portLog}] ${msg}`, data || "");
+		const log = (msg, data) => console.log(`[${address}${portLog}] +${Date.now() - fetchStartedAt}ms ${msg}`, data || "");
 
 		// ---------- 将浏览器→DO 的数据转成可读流 ----------
 		const uplinkQueue = { bytes: 0 };
@@ -821,6 +824,7 @@ export class WsDo extends DurableObject {
 
 		// 远端回包说明这条连接可用：先补响应头，再释放重放数据
 		const onFirstDownlink = () => {
+			log("first downlink byte");
 			sendResponseHeaderOnce();
 			markConfirmed();
 		};
@@ -938,6 +942,10 @@ export default {
 		const id = env.WS_DO.idFromName(name);
 		const stub = env.WS_DO.get(id, { locationHint: doLocation });
 
-		return await stub.fetch(request);
+		// Worker 侧也留一条：和 DO 的日志对不上时，能立刻区分「没转发」还是「DO 日志没显示」
+		const forwardStartedAt = Date.now();
+		const response = await stub.fetch(request);
+		console.log(`[worker] ws → ${name} 耗时 ${Date.now() - forwardStartedAt}ms`);
+		return response;
 	},
 };
