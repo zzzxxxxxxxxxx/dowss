@@ -14,6 +14,7 @@ bindings = [
 
 [vars]
 # PYIP: PROXYIP 回退代理地址，直连失败时通过此 IP 中转
+# 不写端口默认 443；可写 host:port；域名可用 .tp<port> 覆盖（如 xxx.tp2053.xyz）
 # PYIP = "[2602:fc59:b0:64::6810:0]"
 PYIP = "proxyip.us.cmliussss.net:443"
 # UUID4: 节点协议的 userId，没有设置就使用代码内置的 uuid

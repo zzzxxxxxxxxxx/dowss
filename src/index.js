@@ -6,8 +6,17 @@ const textDecoder = new TextDecoder();
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 
-// DNS over HTTPS 服务地址
-const DOH_SERVER = 'https://1.1.1.1/dns-query';
+// DNS over HTTPS：按顺序回退，单次请求带超时，响应按 TTL 做短缓存
+const DOH_SERVERS = [
+	'https://1.1.1.1/dns-query',
+	'https://cloudflare-dns.com/dns-query',
+	'https://dns.google/dns-query',
+];
+const DOH_TIMEOUT_MS = 5000;
+const DNS_CACHE_LIMIT = 256;
+const DNS_CACHE_DEFAULT_TTL = 30;
+const DNS_CACHE_MAX_TTL = 300;
+const dnsCache = new Map();
 
 // 首字节超时：直连/代理连接后若在此时间内无数据返回，触发 retry
 const FIRST_BYTE_TIMEOUT = 3500;
@@ -24,6 +33,7 @@ const COMMAND_UDP = 2;
 
 // early data（sec-websocket-protocol 携带的首包）头长上限，超长一律不按 early data 处理
 const EARLY_DATA_MAX_HEADER_LENGTH = Math.ceil(8 * 1024 * 4 / 3) + 4;
+const EARLY_DATA_MAX_BYTES = 8 * 1024;
 
 // 直连并发拨号数：多路同时建连取最快的一条，吃掉 CF 路由层的黑盒抖动
 const CONCURRENT_DIALS = 2;
@@ -33,6 +43,7 @@ const UPLINK_REPLAY_LIMIT = 256 * 1024;
 
 // 上行队列上限：WS 消息进 ReadableStream 不受背压约束，客户端猛灌时必须有个硬上限
 const UPLINK_QUEUE_LIMIT = 16 * 1024 * 1024;
+const UPLINK_QUEUE_MAX_ITEMS = 4096;
 
 // 上行合包目标：连续小块并到这个大小再写一次 socket，减少 writer.write() 次数
 const UPLINK_PACK_TARGET = 20 * 1024;
@@ -43,6 +54,14 @@ const DOWNLINK_PACK_LIMIT = 32 * 1024;
 const DOWNLINK_TAIL = 512;
 const DOWNLINK_LOW_WATER = Math.max(4096, DOWNLINK_TAIL * 12);
 const DOWNLINK_QUIET_ROUNDS = 4;
+
+// 下行背压：WS 缓冲高于高水位时暂停读 socket，回落到低水位再继续
+const DOWNLINK_BUFFER_HIGH = 4 * 1024 * 1024;
+const DOWNLINK_BUFFER_LOW = 1024 * 1024;
+const DOWNLINK_BUFFER_POLL_MS = 5;
+const DOWNLINK_MAX_STALL_MS = 5000;
+// 运行时读不到 bufferedAmount 时，按累计发送字节定期让出一次事件循环
+const DOWNLINK_YIELD_BYTES = 1024 * 1024;
 
 /* ---------- 伪装页面 ---------- */
 const NGINX_WELCOME = `<!DOCTYPE html>
@@ -119,12 +138,25 @@ function base64ToArrayBuffer(base64Str) {
 			return { earlyData: decoded.buffer, error: null };
 		}
 		base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
+		// Xray 的 early data 用 base64.RawURLEncoding，不带 '='；atob 需要补齐
+		const padding = base64Str.length % 4;
+		if (padding) base64Str += "=".repeat(4 - padding);
 		const decoded = atob(base64Str);
 		const arr = Uint8Array.from(decoded, (c) => c.charCodeAt(0));
 		return { earlyData: arr.buffer, error: null };
 	} catch (e) {
 		return { error: e };
 	}
+}
+
+// early data 只接受 VLESS 头：版本字节后紧跟配置的 UUID
+function isEarlyDataForUUID(earlyData, userIDUint8Array) {
+	const view = new Uint8Array(earlyData);
+	if (view.byteLength < 17) return false;
+	for (let i = 0; i < 16; i++) {
+		if (view[i + 1] !== userIDUint8Array[i]) return false;
+	}
+	return true;
 }
 
 /* ---------- host:port 解析 ---------- */
@@ -159,10 +191,24 @@ function splitHostPort(address) {
 	return { host: str, port: 443 };
 }
 
+function normalizePort(port) {
+	const value = Number(port);
+	return Number.isInteger(value) && value > 0 && value <= 65535 ? value : 443;
+}
+
+// 采用 edgetunnel 的 PYIP 端口规则：不写端口默认 443；host:port 用指定端口；
+// 域名里出现 .tp<port> 时以它为准（例如 xxx.tp2053.xyz）
+function parseProxyEndpoint(address) {
+	const { host, port } = splitHostPort(address);
+	const tpMatch = String(address).toLowerCase().match(/\.tp(\d+)/);
+	return { hostname: host, port: normalizePort(tpMatch ? Number(tpMatch[1]) : port) };
+}
+
 /* ---------- 协议头解析 ---------- */
 function parseProtocolHeader(buffer, userIDUint8Array) {
-	if (!buffer || buffer.byteLength < 24) return { hasError: true, message: "Too short" };
+	if (!buffer || buffer.byteLength < 18) return { hasError: true, message: "Too short" };
 	const view = new Uint8Array(buffer);
+	const length = view.byteLength;
 	// UUID 校验：展开成固定位置比较，省掉循环与偏移计算（UUID 已在实例构造时预解码成 16 字节）
 	const id = userIDUint8Array;
 	if (view[1] !== id[0] || view[2] !== id[1] || view[3] !== id[2] || view[4] !== id[3] ||
@@ -172,12 +218,15 @@ function parseProtocolHeader(buffer, userIDUint8Array) {
 		return { hasError: true, message: "Unauthorized UUID" };
 	}
 	const optLength = view[17];
-	let pos = 18 + optLength + 1;
+	const cmdIndex = 18 + optLength;
+	// 命令(1) + 端口(2) + 地址类型(1)
+	if (cmdIndex + 4 > length) return { hasError: true, message: "Truncated request header" };
 
 	// 命令类型：TCP / UDP
-	const command = view[18 + optLength];
+	const command = view[cmdIndex];
 	const isUDP = command === COMMAND_UDP;
 
+	let pos = cmdIndex + 1;
 	const port = (view[pos] << 8) | view[pos + 1];
 	pos += 2;
 
@@ -185,15 +234,19 @@ function parseProtocolHeader(buffer, userIDUint8Array) {
 	let address = "";
 	if (addrType === ADDR_TYPE_IPV4) {
 		// IPv4
+		if (pos + 4 > length) return { hasError: true, message: "Truncated IPv4 address" };
 		address = `${view[pos++]}.${view[pos++]}.${view[pos++]}.${view[pos++]}`;
 	} else if (addrType === ADDR_TYPE_DOMAIN) {
 		// 域名
+		if (pos + 1 > length) return { hasError: true, message: "Truncated domain length" };
 		const len = view[pos++];
+		if (pos + len > length) return { hasError: true, message: "Truncated domain" };
 		address = textDecoder.decode(view.subarray(pos, pos + len));
 		pos += len;
 	} else if (addrType === ADDR_TYPE_IPV6) {
 		// IPv6：使用 DataView 一次性读取 16 字节
-		const dv = new DataView(buffer, pos, 16);
+		if (pos + 16 > length) return { hasError: true, message: "Truncated IPv6 address" };
+		const dv = new DataView(view.buffer, view.byteOffset + pos, 16);
 		const parts = [];
 		for (let i = 0; i < 8; ++i) {
 			parts.push(dv.getUint16(i * 2).toString(16));
@@ -217,26 +270,38 @@ function parseProtocolHeader(buffer, userIDUint8Array) {
 }
 
 /* ---------- 读取 WebSocket 为 ReadableStream ---------- */
-// queueCounter 用于约束「已入队但还没被消费」的上行字节：controller.enqueue 不受背压约束，客户端猛灌时会无限堆积
-function makeReadableWebSocketStream(ws, earlyDataHeader, log, queueCounter) {
+// queueCounter 用于约束「已入队但还没被消费」的上行字节与条目：controller.enqueue 不受背压约束，客户端猛灌时会无限堆积
+function makeReadableWebSocketStream(ws, earlyDataHeader, log, queueCounter, userIDUint8Array) {
 	let cancelled = false;
 	ws.binaryType = 'arraybuffer';
 	// 超长头不按 early data 解，避免异常客户端用超大 sec-websocket-protocol 撑爆内存
 	const { earlyData, error } = (earlyDataHeader && earlyDataHeader.length <= EARLY_DATA_MAX_HEADER_LENGTH)
 		? base64ToArrayBuffer(earlyDataHeader)
 		: { error: null };
+	// sec-websocket-protocol 也可能被客户端拿去做普通子协议协商；解出来不是 VLESS 头就整段忽略，不要当首包
+	let earlyDataPayload = earlyData;
+	if (!error && earlyData) {
+		const earlyDataBytes = new Uint8Array(earlyData);
+		if (earlyDataBytes.byteLength > EARLY_DATA_MAX_BYTES || !isEarlyDataForUUID(earlyData, userIDUint8Array)) {
+			log && log(`忽略无法识别的 early data（${earlyDataBytes.byteLength}B）`);
+			earlyDataPayload = null;
+		}
+	}
 	const stream = new ReadableStream({
 		start(controller) {
 			const admit = (data) => {
 				const length = data?.byteLength ?? 0;
-				if (queueCounter && queueCounter.bytes + length > UPLINK_QUEUE_LIMIT) {
-					cancelled = true;
-					log(`上行队列超限（>${UPLINK_QUEUE_LIMIT}B），关闭连接`);
-					safeCloseWebSocket(ws);
-					try { controller.error(new Error("uplink queue overflow")); } catch (_) { }
-					return false;
+				if (queueCounter) {
+					if (queueCounter.bytes + length > UPLINK_QUEUE_LIMIT || queueCounter.items + 1 > UPLINK_QUEUE_MAX_ITEMS) {
+						cancelled = true;
+						log(`上行队列超限（>${UPLINK_QUEUE_LIMIT}B 或 >${UPLINK_QUEUE_MAX_ITEMS} 条），关闭连接`);
+						safeCloseWebSocket(ws);
+						try { controller.error(new Error("uplink queue overflow")); } catch (_) { }
+						return false;
+					}
+					queueCounter.bytes += length;
+					queueCounter.items++;
 				}
-				if (queueCounter) queueCounter.bytes += length;
 				return true;
 			};
 			ws.addEventListener("message", (e) => {
@@ -251,9 +316,10 @@ function makeReadableWebSocketStream(ws, earlyDataHeader, log, queueCounter) {
 				controller.error(e);
 			});
 			if (error) {
-				controller.error(error);
-			} else if (earlyData && admit(earlyData)) {
-				controller.enqueue(earlyData);
+				// 不是合法 base64 的 sec-websocket-protocol 直接忽略，避免普通子协议把连接打死
+				log && log(`忽略无效的 early data 头：${error?.message || error}`);
+			} else if (earlyDataPayload && admit(earlyDataPayload)) {
+				controller.enqueue(earlyDataPayload);
 			}
 		},
 		cancel(reason) {
@@ -363,17 +429,44 @@ function makeDownlinkGate(ws, isAlive) {
 	};
 }
 
+function getDownlinkBufferedAmount(ws) {
+	try {
+		const value = Number(ws.bufferedAmount);
+		return Number.isFinite(value) && value >= 0 ? value : null;
+	} catch (_) {
+		return null;
+	}
+}
+
+// bufferedAmount 在部分运行时读不到（返回 undefined），此时退化为按字节让出事件循环
+async function waitDownlinkRoom(ws, isAlive) {
+	let buffered = getDownlinkBufferedAmount(ws);
+	if (buffered === null || buffered <= DOWNLINK_BUFFER_HIGH) return;
+	const deadline = Date.now() + DOWNLINK_MAX_STALL_MS;
+	while (buffered > DOWNLINK_BUFFER_LOW) {
+		if (!isAlive()) throw new Error("downlink closed");
+		// 缓冲量长时间不下降时不再阻塞读取（部分运行时该字段语义不可靠），退回按字节让出
+		if (Date.now() > deadline) return;
+		await new Promise((resolve) => setTimeout(resolve, DOWNLINK_BUFFER_POLL_MS));
+		buffered = getDownlinkBufferedAmount(ws);
+		if (buffered === null) return;
+	}
+}
+
 /* ---------- 下行泵：BYOB 读，大包直发、小包聚合 ---------- */
 async function pumpDownlink(readable, ws, isAlive, onFirstChunk) {
 	const reader = readable.getReader({ mode: 'byob' });
 	const gate = makeDownlinkGate(ws, isAlive);
 	let buffer = new ArrayBuffer(DOWNLINK_READ_CHUNK);
 	let sawFirstChunk = false;
+	let bytesSinceYield = 0;
 	try {
 		for (;;) {
+			await waitDownlinkRoom(ws, isAlive);
 			const { done, value } = await reader.read(new Uint8Array(buffer, 0, DOWNLINK_READ_CHUNK));
 			if (done) break;
 			if (!value?.byteLength) continue;
+			await waitDownlinkRoom(ws, isAlive);
 			if (!sawFirstChunk) {
 				sawFirstChunk = true;
 				onFirstChunk && onFirstChunk();
@@ -387,6 +480,11 @@ async function pumpDownlink(readable, ws, isAlive, onFirstChunk) {
 				// 小包：先 slice 脱离读缓冲，再把读缓冲还回去复用
 				gate.send(value.slice());
 				buffer = value.buffer;
+			}
+			bytesSinceYield += value.byteLength;
+			if (bytesSinceYield >= DOWNLINK_YIELD_BYTES) {
+				bytesSinceYield = 0;
+				await new Promise((resolve) => setTimeout(resolve, 0));
 			}
 		}
 		gate.flush();
@@ -405,17 +503,15 @@ async function relayDownlink(remoteSocket, ws, retry, log, isAlive, onFirstChunk
 	let retryTriggered = false;
 	let firstByteTimer = null;
 
-	// 首字节超时：指定时间内没有回包就强制关闭 socket 触发 retry
-	if (retry) {
-		firstByteTimer = setTimeout(() => {
-			if (!hasIncoming && !retryTriggered) {
-				retryTriggered = true;
-				log && log(`no data within ${FIRST_BYTE_TIMEOUT}ms, triggering retry`);
-				try { remoteSocket.close(); } catch (_) { }
-				retry();
-			}
-		}, FIRST_BYTE_TIMEOUT);
-	}
+	// 首字节超时：只要本世代仍有效就设；最后一次重试没有 retry 可传时也要能关掉连接
+	firstByteTimer = setTimeout(() => {
+		if (hasIncoming || retryTriggered || !isAlive()) return;
+		retryTriggered = true;
+		log && log(`no data within ${FIRST_BYTE_TIMEOUT}ms, triggering retry`);
+		try { remoteSocket.close(); } catch (_) { }
+		if (retry) retry();
+		else safeCloseWebSocket(ws);
+	}, FIRST_BYTE_TIMEOUT);
 
 	try {
 		await pumpDownlink(remoteSocket.readable, ws, isAlive, () => {
@@ -429,6 +525,9 @@ async function relayDownlink(remoteSocket, ws, retry, log, isAlive, onFirstChunk
 	}
 
 	if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
+
+	// 世代已切换 / 客户端已断开：旧连接直接退出，不要触发新的重试
+	if (!isAlive()) return;
 
 	// 统一出口：根据是否有数据决定关闭 WS 还是重试
 	if (retryTriggered) {
@@ -487,7 +586,8 @@ async function dialFastest(fetcher, host, port, attempts, log) {
 
 /* ---------- 建立 TCP 连接（或走代理） ---------- */
 async function handleTCPOutBound(headerInfo, io) {
-	const { proxyInfo, ws, log, fetcher, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, onFirstDownlink, sendResponseHeaderOnce } = io;
+	const { proxyInfo, ws, log, fetcher, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, onFirstDownlink, sendResponseHeaderOnce, setReconnect } = io;
+	if (ws.readyState !== WS_READY_STATE_OPEN) return;
 
 	// 在串行链内建连并挂载；挂载会把未确认数据标成待重发，随后由排空循环写到新连接上
 	async function dialAndAttach(host, port, attempts) {
@@ -503,27 +603,43 @@ async function handleTCPOutBound(headerInfo, io) {
 		if (guard()) onFirstDownlink();
 	};
 
-	// 代理重试：直连握手失败、或直连后首字节超时，都走 ProxyIP，最多 3 次
+	// 代理重试：直连握手失败、直连后首字节超时、上行写失败，都走 ProxyIP，最多 3 次
+	// 同一时间只跑一条重试链：首字节超时和写失败可能同时触发，避免重复拨号
 	let retryRemaining = 3;
-	async function retry() {
-		if (!proxyInfo || retryRemaining <= 0) return;
-		retryRemaining--;
-		log(`retry ${3 - retryRemaining}/3 via proxy ${proxyInfo.hostname}:${headerInfo?.portRemote}`);
-		try {
-			const tcp = await dialAndAttach(proxyInfo.hostname, headerInfo?.portRemote, 1);
-			// 连接已建立：立刻回 VLESS 响应头，不等客户端先给数据
-			sendResponseHeaderOnce();
-			drainUplink();
-			const guard = makeDownlinkGuard();
-			// 还有剩余重试次数则继续传递 retry，否则传 null 停止重试
-			relayDownlink(tcp, ws, retryRemaining > 0 ? retry : null, log, guard, firstDownlinkOf(guard));
-		} catch (err) {
-			// 代理 TCP 握手也失败，继续尝试下一次重试
-			log(`proxy connect failed: ${err.message}, retries left: ${retryRemaining}`);
-			if (retryRemaining > 0) await retry();
-			else safeCloseWebSocket(ws);
-		}
+	let retryTask = null;
+	function retry() {
+		if (retryTask) return retryTask;
+		const task = (async () => {
+			while (retryRemaining > 0 && proxyInfo && ws.readyState === WS_READY_STATE_OPEN) {
+				retryRemaining--;
+				log(`retry ${3 - retryRemaining}/3 via proxy ${proxyInfo.hostname}:${proxyInfo.port}`);
+				let tcp = null;
+				try {
+					tcp = await dialAndAttach(proxyInfo.hostname, proxyInfo.port, 1);
+					if (ws.readyState !== WS_READY_STATE_OPEN) {
+						try { tcp.close(); } catch (_) { }
+						return;
+					}
+					// 连接已建立：立刻回 VLESS 响应头，不等客户端先给数据
+					sendResponseHeaderOnce();
+					drainUplink();
+					const guard = makeDownlinkGuard();
+					relayDownlink(tcp, ws, retry, log, guard, firstDownlinkOf(guard));
+					return;
+				} catch (err) {
+					try { tcp?.close(); } catch (_) { }
+					log(`proxy connect failed: ${err.message}, retries left: ${retryRemaining}`);
+				}
+			}
+			log(proxyInfo ? "proxy retries exhausted, closing WebSocket" : "no PYIP configured and direct connect failed, closing WebSocket");
+			safeCloseWebSocket(ws);
+		})();
+		retryTask = task;
+		task.then(() => { if (retryTask === task) retryTask = null; }, () => { if (retryTask === task) retryTask = null; });
+		return task;
 	}
+	// 上行写失败时由 drainUplink 调回来切新连接
+	setReconnect && setReconnect(retry);
 
 	// IPv6 字面量必须带方括号传给 connect()：运行时会拼成 host:port 交给边缘的 CONNECT 网关，
 	// 不带括号的 IPv6 拼出来是"2001:4860:4828:7700::443"这种无法解析的字符串，会被直接判定
@@ -535,6 +651,10 @@ async function handleTCPOutBound(headerInfo, io) {
 	// 1、先尝试直连（多路竞速）
 	try {
 		const tcp = await dialAndAttach(dialHost, headerInfo?.portRemote, dialAttempts);
+		if (ws.readyState !== WS_READY_STATE_OPEN) {
+			try { tcp.close(); } catch (_) { }
+			return;
+		}
 		// 连接已建立：立刻回 VLESS 响应头，不等客户端先给数据
 		sendResponseHeaderOnce();
 		drainUplink();
@@ -542,10 +662,114 @@ async function handleTCPOutBound(headerInfo, io) {
 		const guard = makeDownlinkGuard();
 		relayDownlink(tcp, ws, retry, log, guard, firstDownlinkOf(guard));
 	} catch (err) {
+		if (ws.readyState !== WS_READY_STATE_OPEN) return;
 		// 直连 TCP 握手失败（SYN 被封锁等），直接走代理重试
 		log(`direct connect failed: ${err.message}, retrying via proxy`);
 		await retry();
 	}
+}
+
+/* ---------- DoH：多服务回退 + 超时 + 短 TTL 缓存 ---------- */
+function bytesToHex(bytes) {
+	let hex = "";
+	for (let i = 0; i < bytes.byteLength; i++) hex += bytes[i].toString(16).padStart(2, "0");
+	return hex;
+}
+
+// 跳过 DNS 名称（含压缩指针），返回下一个字段的偏移
+function skipDnsName(bytes, offset) {
+	while (offset < bytes.byteLength) {
+		const length = bytes[offset];
+		if (length === 0) return offset + 1;
+		if ((length & 0xc0) === 0xc0) return offset + 2;
+		if (length > 63) return -1;
+		offset += 1 + length;
+	}
+	return -1;
+}
+
+// 取答案区最小 TTL 作为缓存时长；解析失败或没有答案时用默认值
+function getDnsCacheTtl(response) {
+	if (response.byteLength < 12) return DNS_CACHE_DEFAULT_TTL;
+	const view = new DataView(response.buffer, response.byteOffset, response.byteLength);
+	const qdcount = view.getUint16(4);
+	const ancount = view.getUint16(6);
+	let offset = 12;
+	for (let i = 0; i < qdcount; i++) {
+		offset = skipDnsName(response, offset);
+		if (offset < 0 || offset + 4 > response.byteLength) return DNS_CACHE_DEFAULT_TTL;
+		offset += 4;
+	}
+	let minTtl = Infinity;
+	for (let i = 0; i < ancount; i++) {
+		offset = skipDnsName(response, offset);
+		if (offset < 0 || offset + 10 > response.byteLength) break;
+		const ttl = view.getUint32(offset + 4);
+		const rdlength = view.getUint16(offset + 8);
+		if (ttl < minTtl) minTtl = ttl;
+		offset += 10 + rdlength;
+		if (offset > response.byteLength) break;
+	}
+	if (!Number.isFinite(minTtl)) return DNS_CACHE_DEFAULT_TTL;
+	return Math.max(5, Math.min(minTtl, DNS_CACHE_MAX_TTL));
+}
+
+async function fetchDohQuery(body, log) {
+	let lastError = null;
+	for (const server of DOH_SERVERS) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), DOH_TIMEOUT_MS);
+		try {
+			const resp = await fetch(server, {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/dns-message',
+					'accept': 'application/dns-message',
+				},
+				body,
+				signal: controller.signal,
+			});
+			if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+			return new Uint8Array(await resp.arrayBuffer());
+		} catch (error) {
+			lastError = error;
+			log && log(`DoH ${server} 失败：${error?.message || error}`);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	throw lastError || new Error("DoH unavailable");
+}
+
+async function resolveDnsQuery(query, log) {
+	const queryBytes = query instanceof Uint8Array ? query : new Uint8Array(query);
+	if (queryBytes.byteLength < 12) return fetchDohQuery(queryBytes, log);
+	// 客户端每次查询的 ID 不同；缓存键把前两个字节清零，命中后再把 ID 改回来
+	const keyBytes = queryBytes.slice();
+	keyBytes[0] = 0;
+	keyBytes[1] = 0;
+	const key = bytesToHex(keyBytes);
+	const queryId = (queryBytes[0] << 8) | queryBytes[1];
+	const now = Date.now();
+	const cached = dnsCache.get(key);
+	if (cached && cached.expires > now) {
+		const out = cached.response.slice();
+		out[0] = queryId >> 8;
+		out[1] = queryId & 0xff;
+		return out;
+	}
+	const response = await fetchDohQuery(queryBytes, log);
+	const copy = response.slice();
+	const ttl = getDnsCacheTtl(response);
+	if (ttl > 0) {
+		if (dnsCache.size >= DNS_CACHE_LIMIT) dnsCache.delete(dnsCache.keys().next().value);
+		dnsCache.set(key, { response: copy, expires: now + ttl * 1000 });
+	}
+	if (copy.byteLength >= 2) {
+		copy[0] = queryId >> 8;
+		copy[1] = queryId & 0xff;
+	}
+	return copy;
 }
 
 /* ---------- UDP DNS 代理（端口 53 → DoH） ---------- */
@@ -577,21 +801,19 @@ async function handleUDPOutBound(webSocket, responseHeader, log) {
 	// 只处理 DNS UDP（端口 53）
 	transformStream.readable.pipeTo(new WritableStream({
 		async write(chunk) {
-			const resp = await fetch(DOH_SERVER, {
-				method: 'POST',
-				headers: { 'content-type': 'application/dns-message' },
-				body: chunk,
-			});
-			const dnsQueryResult = await resp.arrayBuffer();
+			const dnsQueryResult = await resolveDnsQuery(chunk, log);
 			const udpSize = dnsQueryResult.byteLength;
-			const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+			if (!udpSize) return;
+			// 直接拼 Uint8Array 后 send，省掉 Blob → ArrayBuffer 的两次分配
+			const headerLength = isHeaderSent ? 0 : responseHeader.length;
+			const out = new Uint8Array(headerLength + 2 + udpSize);
+			if (headerLength) out.set(responseHeader, 0);
+			out[headerLength] = (udpSize >> 8) & 0xff;
+			out[headerLength + 1] = udpSize & 0xff;
+			out.set(dnsQueryResult, headerLength + 2);
 			if (webSocket.readyState === WS_READY_STATE_OPEN) {
-				if (isHeaderSent) {
-					webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-				} else {
-					webSocket.send(await new Blob([responseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-					isHeaderSent = true;
-				}
+				webSocket.send(out);
+				isHeaderSent = true;
 			}
 		}
 	})).catch((error) => {
@@ -657,8 +879,8 @@ export class WsDo extends DurableObject {
 			throw new Error('request.fetcher.connect unavailable');
 		}
 
-		const hostPort = splitHostPort(this.proxyAddress);
-		const proxyInfo = hostPort.host ? { hostname: hostPort.host, port: hostPort.port } : null;
+		// PYIP 端口按 edgetunnel 的规则取值，不再跟随目标端口
+		const proxyInfo = this.proxyAddress ? parseProxyEndpoint(this.proxyAddress) : null;
 
 		// ----------------- 真实的 WebSocket 处理 -----------------
 		const [clientSide, serverSide] = Object.values(new WebSocketPair());
@@ -672,9 +894,9 @@ export class WsDo extends DurableObject {
 		const log = (msg, data) => console.log(`[${address}${portLog}] +${Date.now() - fetchStartedAt}ms ${msg}`, data || "");
 
 		// ---------- 将浏览器→DO 的数据转成可读流 ----------
-		const uplinkQueue = { bytes: 0 };
+		const uplinkQueue = { bytes: 0, items: 0 };
 		const earlyProtoHeader = request.headers.get("sec-websocket-protocol") || "";
-		const inbound = makeReadableWebSocketStream(serverSide, earlyProtoHeader, log, uplinkQueue);
+		const inbound = makeReadableWebSocketStream(serverSide, earlyProtoHeader, log, uplinkQueue, userIDUint8Array);
 
 		// ---------- 用一个 wrapper 保存 "远程 TCP socket" ----------
 		const remoteSocketWrapper = { value: null };
@@ -692,6 +914,8 @@ export class WsDo extends DurableObject {
 		let uplinkPackBuffer = null;
 		let downlinkGen = 0;
 		let uplinkChain = Promise.resolve();
+		let reconnect = null;
+		let clientClosed = false;
 
 		// 所有上行写入串行化：保证「切到新 socket」和正在进行的写入不会交错，避免重放丢数据或重复发送
 		const serialUplink = (task) => {
@@ -704,6 +928,22 @@ export class WsDo extends DurableObject {
 			try { currentWriter && currentWriter.releaseLock(); } catch (_) { }
 			currentWriter = null;
 		};
+
+		// 客户端断开时只关 inbound 流不够：出站 socket 和 DO 实例会一直留到远端 EOF
+		const teardownClient = () => {
+			if (clientClosed) return;
+			clientClosed = true;
+			// 世代自增让旧下行泵/旧首字节定时器立刻失效，再关掉出站连接并释放写入器
+			downlinkGen++;
+			releaseWriter();
+			const socket = remoteSocketWrapper.value;
+			remoteSocketWrapper.value = null;
+			if (socket) {
+				try { socket.close(); } catch (_) { }
+			}
+		};
+		serverSide.addEventListener("close", teardownClient);
+		serverSide.addEventListener("error", teardownClient);
 
 		// 丢掉「已写进 socket」的前缀，只保留还没写出去的部分
 		const dropWrittenPrefix = () => {
@@ -785,6 +1025,10 @@ export class WsDo extends DurableObject {
 					} catch (e) {
 						log(`uplink write error: ${e?.message || e}`);
 						releaseWriter();
+						// 还没收到任何下行时切代理重放是安全的；已确认的连接重放会把半截 TLS 流拼到新连接上，
+						// 这种情况直接关 WS 让客户端重连
+						if (reconnect && !clientClosed && !uplink.confirmed) reconnect().catch((err) => log(`retry after uplink write error failed: ${err?.message || err}`));
+						else safeCloseWebSocket(serverSide);
 					}
 				}).catch(() => { }).finally(() => {
 					draining = false;
@@ -851,6 +1095,7 @@ export class WsDo extends DurableObject {
 			makeDownlinkGuard,
 			onFirstDownlink,
 			sendResponseHeaderOnce,
+			setReconnect: (fn) => { reconnect = fn; },
 		};
 
 		// ---------- 把 inbound 流 pipe 到处理函数 ----------
@@ -859,6 +1104,7 @@ export class WsDo extends DurableObject {
 				new WritableStream({
 					async write(chunk, controller) {
 						uplinkQueue.bytes -= (chunk?.byteLength ?? 0);
+						if (uplinkQueue.items > 0) uplinkQueue.items--;
 						// DNS UDP 已建立，直接转发 DNS 数据
 						if (isDns && udpWrite) {
 							return udpWrite(chunk);
