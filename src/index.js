@@ -528,9 +528,16 @@ async function handleTCPOutBound(headerInfo, io) {
 		}
 	}
 
+	// IPv6 字面量必须带方括号传给 connect()：运行时会拼成 host:port 交给边缘的 CONNECT 网关，
+	// 不带括号的 IPv6 拼出来是"2001:4860:4828:7700::443"这种无法解析的字符串，会被直接判定
+	// 为非法地址（实测无括号 1ms 被拒、带括号 3ms 连上）。
+	const dialHost = headerInfo?.addressType === ADDR_TYPE_IPV6
+		? `[${headerInfo?.addressRemote}]`
+		: headerInfo?.addressRemote;
+
 	// 1、先尝试直连（多路竞速）
 	try {
-		const tcp = await dialAndAttach(headerInfo?.addressRemote, headerInfo?.portRemote, dialAttempts);
+		const tcp = await dialAndAttach(dialHost, headerInfo?.portRemote, dialAttempts);
 		// 连接已建立：立刻回 VLESS 响应头，不等客户端先给数据
 		sendResponseHeaderOnce();
 		drainUplink();

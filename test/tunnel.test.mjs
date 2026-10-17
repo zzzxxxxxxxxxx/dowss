@@ -97,6 +97,23 @@ function buildPacket(payload = 'HELLO', port = 443) {
 	return buf.buffer;
 }
 
+// 构造 ATYP=3（IPv6）的 VLESS 请求头
+function buildPacketV6(groups, payload = 'HELLO', port = 443) {
+	const hex = UUID.replace(/-/g, '');
+	const payloadBytes = enc.encode(payload);
+	const buf = new Uint8Array(42 + payloadBytes.length);
+	let o = 0;
+	buf[o++] = 0;
+	for (let i = 0; i < 16; i++) buf[o++] = parseInt(hex.substr(i * 2, 2), 16);
+	buf[o++] = 0;              // optLen
+	buf[o++] = 1;              // cmd = TCP
+	buf[o++] = port >> 8; buf[o++] = port & 0xff;
+	buf[o++] = 3;              // atyp = IPv6
+	for (let i = 0; i < 8; i++) { const v = groups[i] || 0; buf[o++] = v >> 8; buf[o++] = v & 0xff; }
+	buf.set(payloadBytes, o);
+	return buf.buffer;
+}
+
 async function openTunnel(env = {}) {
 	const instance = new WsDo({ waitUntil() { } }, { PYIP: '2001:db8::1', UUID4: UUID, ...env });
 	const request = new Request('https://x.test/', { headers: { Upgrade: 'websocket' } });
@@ -274,6 +291,21 @@ let passed = 0;
 	winner.s.push(new Uint8Array([1]));   // 取消首字节超时定时器
 	await tick(20);
 	console.log('T7 首包无载荷也要回响应头（否则与等响应头的客户端互相死等）');
+	passed++;
+}
+
+// ================= T8 IPv6 目标拨号地址必须带方括号 =================
+{
+	globalThis.__socketStub = { calls: [], handler: () => makeSocket() };
+	const { serverSide } = await openTunnel();
+	serverSide.emit('message', { data: buildPacketV6([0x2001, 0x4860, 0x4828, 0x7700, 0, 0, 0, 0]) });
+	await tick(200);
+	assert.equal(
+		globalThis.__socketStub.calls[0].hostname,
+		'[2001:4860:4828:7700:0:0:0:0]',
+		`T8: IPv6 目标拨号必须带方括号，实际: ${JSON.stringify(globalThis.__socketStub.calls[0])}`
+	);
+	console.log('T8 IPv6 目标拨号地址带方括号（不带时边缘判定为非法地址）');
 	passed++;
 }
 
