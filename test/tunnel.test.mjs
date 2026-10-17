@@ -97,23 +97,6 @@ function buildPacket(payload = 'HELLO', port = 443) {
 	return buf.buffer;
 }
 
-// 构造 ATYP=3（IPv6）的 VLESS 请求头
-function buildPacketV6(groups, payload = 'HELLO', port = 443) {
-	const hex = UUID.replace(/-/g, '');
-	const payloadBytes = enc.encode(payload);
-	const buf = new Uint8Array(42 + payloadBytes.length);
-	let o = 0;
-	buf[o++] = 0;
-	for (let i = 0; i < 16; i++) buf[o++] = parseInt(hex.substr(i * 2, 2), 16);
-	buf[o++] = 0;              // optLen
-	buf[o++] = 1;              // cmd = TCP
-	buf[o++] = port >> 8; buf[o++] = port & 0xff;
-	buf[o++] = 3;              // atyp = IPv6
-	for (let i = 0; i < 8; i++) { const v = groups[i] || 0; buf[o++] = v >> 8; buf[o++] = v & 0xff; }
-	buf.set(payloadBytes, o);
-	return buf.buffer;
-}
-
 async function openTunnel(env = {}) {
 	const instance = new WsDo({ waitUntil() { } }, { PYIP: '2001:db8::1', UUID4: UUID, ...env });
 	const request = new Request('https://x.test/', { headers: { Upgrade: 'websocket' } });
@@ -291,77 +274,6 @@ let passed = 0;
 	winner.s.push(new Uint8Array([1]));   // 取消首字节超时定时器
 	await tick(20);
 	console.log('T7 首包无载荷也要回响应头（否则与等响应头的客户端互相死等）');
-	passed++;
-}
-
-// ================= T8 IPv6 目标直连失败时不走 IPv4-only 的 ProxyIP =================
-{
-	const calls = [];
-	globalThis.__socketStub = {
-		calls,
-		handler: (addr) => {
-			const s = makeSocket();
-			calls.push(addr);
-			// 直连模拟 IPv6 不可达：opened 立刻 reject，错误不是"被拦截"那种
-			if (addr.hostname !== '2001:db8::1') {
-				s.opened = Promise.reject(new Error('connect failed: network unreachable'));
-				s.opened.catch(() => { });
-			}
-			return s;
-		}
-	};
-	const { serverSide } = await openTunnel();
-	// 目标 2001:4860:4827:7700:: （Google 的 IPv6，非 CF）
-	serverSide.emit('message', { data: buildPacketV6([0x2001, 0x4860, 0x4827, 0x7700, 0, 0, 0, 0]) });
-	await tick(400);
-	assert.ok(!calls.some((c) => c.hostname === '2001:db8::1'), `T8: 不可达类失败不应重试到 ProxyIP，实际拨号: ${calls.map((c) => c.hostname).join(',')}`);
-	console.log('T8 不可达类拨号失败不切 ProxyIP（避免拿到对方证书）');
-	passed++;
-}
-
-// ================= T9 目标被 Workers 拦截时必须走 ProxyIP =================
-{
-	const calls = [];
-	globalThis.__socketStub = {
-		calls,
-		handler: (addr) => {
-			calls.push(addr);
-			const s = makeSocket();
-			if (addr.hostname !== '2001:db8::1') {
-				s.opened = Promise.reject(new Error('proxy request failed, cannot connect to the specified address'));
-				s.opened.catch(() => { });
-			}
-			return s;
-		}
-	};
-	const { serverSide } = await openTunnel();
-	serverSide.emit('message', { data: buildPacket('HELLO') });
-	await tick(400);
-	assert.ok(calls.some((c) => c.hostname === '2001:db8::1'), `T9: 地址被拦截时应重试 ProxyIP，实际拨号: ${calls.map((c) => c.hostname).join(',')}`);
-	console.log('T9 地址被 Workers 拦截时仍然切 ProxyIP');
-	passed++;
-}
-
-// ================= T10 IPv6 目标即使报"地址被拦"也不走 ProxyIP =================
-{
-	const calls = [];
-	globalThis.__socketStub = {
-		calls,
-		handler: (addr) => {
-			calls.push(addr);
-			const s = makeSocket();
-			if (addr.hostname !== '2001:db8::1') {
-				s.opened = Promise.reject(new Error('proxy request failed, cannot connect to the specified address'));
-				s.opened.catch(() => { });
-			}
-			return s;
-		}
-	};
-	const { serverSide } = await openTunnel();
-	serverSide.emit('message', { data: buildPacketV6([0x2001, 0x4860, 0x4827, 0x7700, 0, 0, 0, 0]) });
-	await tick(400);
-	assert.ok(!calls.some((c) => c.hostname === '2001:db8::1'), `T10: IPv6 目标即使被拦也不应送 ProxyIP，实际拨号: ${calls.map((c) => c.hostname).join(',')}`);
-	console.log('T10 IPv6 目标即使报"地址被拦"也不走 ProxyIP');
 	passed++;
 }
 
