@@ -1,5 +1,4 @@
 import { DurableObject } from "cloudflare:workers";
-import { connect } from "cloudflare:sockets";
 
 const textDecoder = new TextDecoder();
 
@@ -448,11 +447,9 @@ async function relayDownlink(remoteSocket, ws, retry, log, isAlive, onFirstChunk
 	}
 }
 
-/* ---------- 单次拨号：走官方 cloudflare:sockets 的 connect，带超时 ---------- */
-// 注意：不要换成 request.fetcher.connect（GrainTCP 灰接口）——那个接口会拒绝 IPv6 目标，
-// 报 "cannot connect to the specified address"，表现为所有 IPv6 站点都直连失败。
-async function dialWithTimeout(host, port, timeoutMs) {
-	const socket = connect({ hostname: host, port });
+/* ---------- 单次拨号：走 request 级 fetcher（GrainTCP 的灰接口），带超时 ---------- */
+async function dialWithTimeout(fetcher, host, port, timeoutMs) {
+	const socket = fetcher.connect({ hostname: host, port });
 	let timer = null;
 	try {
 		await Promise.race([
@@ -472,10 +469,10 @@ async function dialWithTimeout(host, port, timeoutMs) {
 }
 
 /* ---------- 并发拨号：多路同时建连，取最先打开的那条 ---------- */
-async function dialFastest(host, port, attempts, log) {
-	if (!(attempts > 1)) return dialWithTimeout(host, port, DIAL_TIMEOUT);
+async function dialFastest(fetcher, host, port, attempts, log) {
+	if (!(attempts > 1)) return dialWithTimeout(fetcher, host, port, DIAL_TIMEOUT);
 	// dialWithTimeout 是 async，同步抛错（地址非法等）会自动变成 rejected promise，交给 Promise.any 统一处理
-	const pendingDials = Array.from({ length: attempts }, () => dialWithTimeout(host, port, DIAL_TIMEOUT));
+	const pendingDials = Array.from({ length: attempts }, () => dialWithTimeout(fetcher, host, port, DIAL_TIMEOUT));
 	// 落败分支的 rejection 要先接住，否则会变成未处理的 rejection
 	pendingDials.forEach((p) => p.catch(() => { }));
 	try {
@@ -492,12 +489,12 @@ async function dialFastest(host, port, attempts, log) {
 
 /* ---------- 建立 TCP 连接（或走代理） ---------- */
 async function handleTCPOutBound(headerInfo, io) {
-	const { proxyInfo, ws, log, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, onFirstDownlink, sendResponseHeaderOnce } = io;
+	const { proxyInfo, ws, log, fetcher, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, onFirstDownlink, sendResponseHeaderOnce } = io;
 
 	// 在串行链内建连并挂载；挂载会把未确认数据标成待重发，随后由排空循环写到新连接上
 	async function dialAndAttach(host, port, attempts) {
 		return serialUplink(async () => {
-			const tcp = await dialFastest(host, port, attempts, log);
+			const tcp = await dialFastest(fetcher, host, port, attempts, log);
 			attachSocket(tcp);
 			log(`connected to ${host}:${port}`);
 			return tcp;
@@ -835,10 +832,17 @@ export class WsDo extends DurableObject {
 			markConfirmed();
 		};
 
+		// 用 request 级的 fetcher 拨 TCP（GrainTCP 的灰接口），这样不必 import cloudflare:sockets
+		const fetcher = /** @type {any} */ (request).fetcher;
+		if (!fetcher || typeof fetcher.connect !== 'function') {
+			throw new Error('request.fetcher.connect unavailable');
+		}
+
 		const io = {
 			proxyInfo,
 			ws: serverSide,
 			log,
+			fetcher,
 			dialAttempts,
 			serialUplink,
 			attachSocket,
