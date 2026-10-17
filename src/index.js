@@ -651,6 +651,11 @@ export class WsDo extends DurableObject {
 		// ----------------- 读取运行时配置 -----------------
 		const userIDUint8Array = this.userIDUint8Array;
 
+		// 用 request 级的 fetcher 拨 TCP（GrainTCP 的灰接口），这样不必 import cloudflare:sockets
+		const fetcher = /** @type {any} */ (request).fetcher;
+		if (!fetcher || typeof fetcher.connect !== 'function') {
+			throw new Error('request.fetcher.connect unavailable');
+		}
 
 		const hostPort = splitHostPort(this.proxyAddress);
 		const proxyInfo = hostPort.host ? { hostname: hostPort.host, port: hostPort.port } : null;
@@ -833,12 +838,6 @@ export class WsDo extends DurableObject {
 			sendResponseHeaderOnce();
 			markConfirmed();
 		};
-
-		// 用 request 级的 fetcher 拨 TCP（GrainTCP 的灰接口），这样不必 import cloudflare:sockets
-		const fetcher = /** @type {any} */ (request).fetcher;
-		if (!fetcher || typeof fetcher.connect !== 'function') {
-			throw new Error('request.fetcher.connect unavailable');
-		}
 
 		const io = {
 			proxyInfo,
