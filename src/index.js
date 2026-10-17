@@ -436,7 +436,6 @@ async function relayDownlink(remoteSocket, ws, retry, log, isAlive, onFirstChunk
 		return;
 	}
 	if (hasIncoming) {
-		log && log("data transfer complete, closing WebSocket");
 		safeCloseWebSocket(ws);
 	} else if (retry) {
 		log && log("no data from remote, retrying via proxy");
@@ -480,7 +479,6 @@ async function dialFastest(fetcher, host, port, attempts, log) {
 		pendingDials.forEach((p) => p.then((s) => {
 			if (s !== winner) { try { s.close(); } catch (_) { } }
 		}, () => { }));
-		log(`dial race ${attempts} 路 → ${host}:${port}`);
 		return winner;
 	} catch (e) {
 		throw (e instanceof AggregateError && e.errors.length) ? e.errors[0] : e;
@@ -496,7 +494,6 @@ async function handleTCPOutBound(headerInfo, io) {
 		return serialUplink(async () => {
 			const tcp = await dialFastest(fetcher, host, port, attempts, log);
 			attachSocket(tcp);
-			log(`connected to ${host}:${port}`);
 			return tcp;
 		});
 	}
@@ -589,7 +586,6 @@ async function handleUDPOutBound(webSocket, responseHeader, log) {
 			const udpSize = dnsQueryResult.byteLength;
 			const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
 			if (webSocket.readyState === WS_READY_STATE_OPEN) {
-				log(`doh success and dns message length is ${udpSize}`);
 				if (isHeaderSent) {
 					webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
 				} else {
@@ -834,7 +830,6 @@ export class WsDo extends DurableObject {
 
 		// 远端回包说明这条连接可用：释放重放数据。响应头在建连后已经发过了（幂等兜底一次）。
 		const onFirstDownlink = () => {
-			log("first downlink byte");
 			sendResponseHeaderOnce();
 			markConfirmed();
 		};
@@ -907,7 +902,6 @@ export class WsDo extends DurableObject {
 						await handleTCPOutBound(headerInfo, io);
 					},
 					close() {
-						log("inbound stream closed");
 					},
 					abort(reason) {
 						log("inbound stream aborted", reason);
@@ -962,7 +956,6 @@ export default {
 		// Worker 侧也留一条：和 DO 的日志对不上时，能立刻区分「没转发」还是「DO 日志没显示」
 		const forwardStartedAt = Date.now();
 		const response = await stub.fetch(request);
-		console.log(`[worker] ws → ${name} 耗时 ${Date.now() - forwardStartedAt}ms`);
 		return response;
 	},
 };
