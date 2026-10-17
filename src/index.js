@@ -489,7 +489,7 @@ async function dialFastest(fetcher, host, port, attempts, log) {
 
 /* ---------- 建立 TCP 连接（或走代理） ---------- */
 async function handleTCPOutBound(headerInfo, io) {
-	const { proxyInfo, ws, log, fetcher, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, onFirstDownlink } = io;
+	const { proxyInfo, ws, log, fetcher, serialUplink, dialAttempts, attachSocket, drainUplink, makeDownlinkGuard, onFirstDownlink, sendResponseHeaderOnce } = io;
 
 	// 在串行链内建连并挂载；挂载会把未确认数据标成待重发，随后由排空循环写到新连接上
 	async function dialAndAttach(host, port, attempts) {
@@ -514,6 +514,8 @@ async function handleTCPOutBound(headerInfo, io) {
 		log(`retry ${3 - retryRemaining}/3 via proxy ${proxyInfo.hostname}:${headerInfo?.portRemote}`);
 		try {
 			const tcp = await dialAndAttach(proxyInfo.hostname, headerInfo?.portRemote, 1);
+			// 连接已建立：立刻回 VLESS 响应头，不等客户端先给数据
+			sendResponseHeaderOnce();
 			drainUplink();
 			const guard = makeDownlinkGuard();
 			// 还有剩余重试次数则继续传递 retry，否则传 null 停止重试
@@ -529,6 +531,8 @@ async function handleTCPOutBound(headerInfo, io) {
 	// 1、先尝试直连（多路竞速）
 	try {
 		const tcp = await dialAndAttach(headerInfo?.addressRemote, headerInfo?.portRemote, dialAttempts);
+		// 连接已建立：立刻回 VLESS 响应头，不等客户端先给数据
+		sendResponseHeaderOnce();
 		drainUplink();
 		// 2、再把读写流桥接（直连无数据时触发 retry）
 		const guard = makeDownlinkGuard();
@@ -810,10 +814,14 @@ export class WsDo extends DurableObject {
 			return () => downlinkGen === gen && serverSide.readyState === WS_READY_STATE_OPEN;
 		};
 
-		// 响应头不在解析首包时发。开了 early data 的客户端，首包是在 makeReadableWebSocketStream
-		// 的 start() 里就被喂进管道的，那次写入可能早于 DO 的 101 送达客户端，这一帧在真实边缘有概率
-		// 被丢掉（客户端就会把第一个载荷字节当成版本号读）。改成第一条下行数据到达时随流发出：
-		// 那时客户端的请求已经在 WS 上跑过，握手必然已经完成。
+		// 响应头的发送时机受两条约束夹着：
+		// 1) 不能在解析首包时立刻发。开了 early data 的客户端，首包是在 makeReadableWebSocketStream
+		//    的 start() 里就进管道的，那次写入可能早于 DO 的 101 送达客户端，帧在真实边缘有概率被丢掉
+		//    （客户端就会把第一个载荷字节当成版本号读）。
+		// 2) 也不能等首条下行数据再发。VLESS 客户端（sing-box）会在建连流程里同步等响应头，拿到才把
+		//    业务数据发出来；而首包没有载荷（没 sniff 到数据）时，两边就互等，3.5 秒后首字节超时切
+		//    PYIP，浏览器侧看到的是 TLS 握手中途失败。
+		// 所以：目标连接建立后立刻发 —— 一次拨号至少一个 RTT，那时 101 必然已送达；且不依赖客户端先给数据。
 		let responseHeader = null;
 		let responseHeaderSent = false;
 		const sendResponseHeaderOnce = () => {
@@ -822,7 +830,7 @@ export class WsDo extends DurableObject {
 			if (serverSide.readyState === WS_READY_STATE_OPEN) serverSide.send(responseHeader);
 		};
 
-		// 远端回包说明这条连接可用：先补响应头，再释放重放数据
+		// 远端回包说明这条连接可用：释放重放数据。响应头在建连后已经发过了（幂等兜底一次）。
 		const onFirstDownlink = () => {
 			log("first downlink byte");
 			sendResponseHeaderOnce();
@@ -840,6 +848,7 @@ export class WsDo extends DurableObject {
 			drainUplink,
 			makeDownlinkGuard,
 			onFirstDownlink,
+			sendResponseHeaderOnce,
 		};
 
 		// ---------- 把 inbound 流 pipe 到处理函数 ----------
@@ -881,7 +890,7 @@ export class WsDo extends DurableObject {
 							}
 						}
 
-						// ----- TCP：响应头留到第一条下行数据时再发（原因见 sendResponseHeaderOnce 的注释）-----
+						// ----- TCP：响应头在目标连接建立后由 handleTCPOutBound 发出（原因见 sendResponseHeaderOnce 的注释）-----
 						// UDP 分支由 handleUDPOutBound 自己带响应头，不走这里
 						responseHeader = headerInfo.responseHeader;
 

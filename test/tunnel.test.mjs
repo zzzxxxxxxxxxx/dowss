@@ -107,7 +107,7 @@ async function openTunnel(env = {}) {
 
 let passed = 0;
 
-// ================= T1 响应头随首条下行数据发出 + 直连并发拨号 =================
+// ================= T1 建连后立刻回响应头 + 直连并发拨号 =================
 {
 	const sockets = installStub();
 	const { serverSide } = await openTunnel();
@@ -118,14 +118,14 @@ let passed = 0;
 	assert.deepEqual(globalThis.__socketStub.calls[0], { hostname: '1.1.1.1', port: 443 });
 	const winner = sockets.find((x) => !x.s.isClosed());
 	assert.ok(winner, 'T1: 应有一条连接胜出');
-	// 关键不变式：没有下行数据之前不能发响应头，否则会与 101 握手竞态（early data 场景下真实丢帧）
-	assert.equal(serverSide.sent.length, 0, 'T1: 首条下行数据之前不应发响应头');
+	// 关键不变式之一：建连成功就要回响应头，且不依赖客户端先给数据
+	assert.deepEqual([...serverSide.sent[0]], [0, 0], 'T1: 建连后应立刻回响应头');
+	assert.equal(serverSide.sent.length, 1, 'T1: 建连后只应发这一帧响应头');
 	assert.equal(winner.s.content(), 'HELLO', 'T1: 首包载荷应写入胜出连接');
-	// 让远端回一次包：既是首条下行数据，也顺便取消首字节超时定时器
+	// 让远端回一次包，取消首字节超时定时器
 	winner.s.push(new Uint8Array([1]));
 	await tick(20);
-	assert.deepEqual([...serverSide.sent[0]], [0, 0], 'T1: 响应头应随首条下行数据先发');
-	console.log('T1 响应头随首条下行数据发出（避开 101 竞态）；直连 2 路竞速，载荷写入胜出连接');
+	console.log('T1 建连后立刻回响应头（不等下行数据）；直连 2 路竞速，载荷写入胜出连接');
 	passed++;
 }
 
@@ -257,6 +257,23 @@ let passed = 0;
 	proxy.s.push(new Uint8Array([1]));
 	await tick(20);
 	console.log('T6 直连丢 SYN → 拨号超时 → 切代理并重放');
+	passed++;
+}
+
+// ================= T7 首包无载荷时也要回响应头 =================
+{
+	const sockets = installStub();
+	const { serverSide } = await openTunnel();
+	// 只发 VLESS 头、不带任何载荷：模拟"先建连、等响应头、再发业务数据"的客户端（sing-box 就是这种）
+	serverSide.emit('message', { data: buildPacket('') });
+	await tick(60);
+	const winner = sockets.find((x) => !x.s.isClosed());
+	assert.ok(winner, 'T7: 应有一条连接胜出');
+	assert.deepEqual([...serverSide.sent[0]], [0, 0], 'T7: 建连后必须立刻回响应头，不能等客户端先给数据');
+	assert.equal(winner.s.content(), '', 'T7: 没有载荷时不应往目标写数据');
+	winner.s.push(new Uint8Array([1]));   // 取消首字节超时定时器
+	await tick(20);
+	console.log('T7 首包无载荷也要回响应头（否则与等响应头的客户端互相死等）');
 	passed++;
 }
 
