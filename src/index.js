@@ -510,6 +510,15 @@ async function handleTCPOutBound(headerInfo, io) {
 	let retryRemaining = 3;
 	async function retry() {
 		if (!proxyInfo || retryRemaining <= 0) return;
+		// ProxyIP 只承载 IPv4（它本身是给 CF 站点做中转的 IPv4 反向代理）。IPv6 目标重试过去，
+		// 对方会用自己的证书应答，客户端看到的是 ERR_CERT_COMMON_NAME_INVALID 或
+		// ERR_SSL_VERSION_OR_CIPHER_MISMATCH。直接关连接，让客户端按 Happy Eyeballs 回落 IPv4；
+		// CF 站点若是 IPv6 被拦，IPv4 那一路会正常走"直连被拦 → PYIP"。
+		if (headerInfo?.addressType === ADDR_TYPE_IPV6) {
+			log(`retry skipped: IPv6 target ${headerInfo?.addressRemote} cannot use IPv4-only proxyip`);
+			safeCloseWebSocket(ws);
+			return;
+		}
 		retryRemaining--;
 		log(`retry ${3 - retryRemaining}/3 via proxy ${proxyInfo.hostname}:${headerInfo?.portRemote}`);
 		try {

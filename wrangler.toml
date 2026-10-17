@@ -24,3 +24,8 @@ REGION = "wnam"
 # DO_SHARDS: DO 分片数。1 = 所有连接共用一个实例（出口 IP 最稳、duration 计费最省）
 # >1 = 每条连接随机挑一个分片，并发连接摊到多个实例；注意 duration 额度按实例数成倍消耗
 DO_SHARDS = "1"
+
+# 打开 Workers Logs：DO 里的分段计时日志会进 dashboard 的 Observability，用于定位连接问题。
+# 免费版额度 20 万条/天，dowss 这个量级够用。
+[observability]
+enabled = true
