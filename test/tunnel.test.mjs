@@ -302,9 +302,9 @@ let passed = 0;
 		handler: (addr) => {
 			const s = makeSocket();
 			calls.push(addr);
-			// 直连模拟 IPv6 不可达：opened 立刻 reject（真实边缘就是这个行为，235ms 内报错）
+			// 直连模拟 IPv6 不可达：opened 立刻 reject，错误不是"被拦截"那种
 			if (addr.hostname !== '2001:db8::1') {
-				s.opened = Promise.reject(new Error('proxy request failed, cannot connect to the specified address'));
+				s.opened = Promise.reject(new Error('connect failed: network unreachable'));
 				s.opened.catch(() => { });
 			}
 			return s;
@@ -314,8 +314,54 @@ let passed = 0;
 	// 目标 2001:4860:4827:7700:: （Google 的 IPv6，非 CF）
 	serverSide.emit('message', { data: buildPacketV6([0x2001, 0x4860, 0x4827, 0x7700, 0, 0, 0, 0]) });
 	await tick(400);
-	assert.ok(!calls.some((c) => c.hostname === '2001:db8::1'), `T8: IPv6 目标失败后不应重试到 ProxyIP，实际拨号: ${calls.map((c) => c.hostname).join(',')}`);
-	console.log('T8 IPv6 目标直连失败后不切 ProxyIP（避免对方拿错证书）');
+	assert.ok(!calls.some((c) => c.hostname === '2001:db8::1'), `T8: 不可达类失败不应重试到 ProxyIP，实际拨号: ${calls.map((c) => c.hostname).join(',')}`);
+	console.log('T8 不可达类拨号失败不切 ProxyIP（避免拿到对方证书）');
+	passed++;
+}
+
+// ================= T9 目标被 Workers 拦截时必须走 ProxyIP =================
+{
+	const calls = [];
+	globalThis.__socketStub = {
+		calls,
+		handler: (addr) => {
+			calls.push(addr);
+			const s = makeSocket();
+			if (addr.hostname !== '2001:db8::1') {
+				s.opened = Promise.reject(new Error('proxy request failed, cannot connect to the specified address'));
+				s.opened.catch(() => { });
+			}
+			return s;
+		}
+	};
+	const { serverSide } = await openTunnel();
+	serverSide.emit('message', { data: buildPacket('HELLO') });
+	await tick(400);
+	assert.ok(calls.some((c) => c.hostname === '2001:db8::1'), `T9: 地址被拦截时应重试 ProxyIP，实际拨号: ${calls.map((c) => c.hostname).join(',')}`);
+	console.log('T9 地址被 Workers 拦截时仍然切 ProxyIP');
+	passed++;
+}
+
+// ================= T10 IPv6 目标即使报"地址被拦"也不走 ProxyIP =================
+{
+	const calls = [];
+	globalThis.__socketStub = {
+		calls,
+		handler: (addr) => {
+			calls.push(addr);
+			const s = makeSocket();
+			if (addr.hostname !== '2001:db8::1') {
+				s.opened = Promise.reject(new Error('proxy request failed, cannot connect to the specified address'));
+				s.opened.catch(() => { });
+			}
+			return s;
+		}
+	};
+	const { serverSide } = await openTunnel();
+	serverSide.emit('message', { data: buildPacketV6([0x2001, 0x4860, 0x4827, 0x7700, 0, 0, 0, 0]) });
+	await tick(400);
+	assert.ok(!calls.some((c) => c.hostname === '2001:db8::1'), `T10: IPv6 目标即使被拦也不应送 ProxyIP，实际拨号: ${calls.map((c) => c.hostname).join(',')}`);
+	console.log('T10 IPv6 目标即使报"地址被拦"也不走 ProxyIP');
 	passed++;
 }
 

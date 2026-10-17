@@ -468,6 +468,16 @@ async function dialWithTimeout(fetcher, host, port, timeoutMs) {
 	}
 }
 
+/* ---------- 哪些拨号失败值得用 ProxyIP 重试 ---------- */
+// ProxyIP 是给 Cloudflare 站点做 IPv4 中继的中转：只有「目标地址被 Workers 拦截」和「拨号超时
+// （目标不可达/被丢包）」这两种失败才可能被它救回来。其它失败（IPv6 不可达、对端拒绝、TLS 前的
+// 各种错误）重试过去只会连到 ProxyIP 自己，客户端拿到的是它的证书，于是报
+// ERR_CERT_COMMON_NAME_INVALID 或 ERR_SSL_VERSION_OR_CIPHER_MISMATCH。
+function shouldRetryViaProxy(err) {
+	const msg = String(err?.message ?? err ?? "");
+	return /cannot connect to the specified address/i.test(msg) || /dial timeout/i.test(msg);
+}
+
 /* ---------- 并发拨号：多路同时建连，取最先打开的那条 ---------- */
 async function dialFastest(fetcher, host, port, attempts, log) {
 	if (!(attempts > 1)) return dialWithTimeout(fetcher, host, port, DIAL_TIMEOUT);
@@ -510,10 +520,9 @@ async function handleTCPOutBound(headerInfo, io) {
 	let retryRemaining = 3;
 	async function retry() {
 		if (!proxyInfo || retryRemaining <= 0) return;
-		// ProxyIP 只承载 IPv4（它本身是给 CF 站点做中转的 IPv4 反向代理）。IPv6 目标重试过去，
-		// 对方会用自己的证书应答，客户端看到的是 ERR_CERT_COMMON_NAME_INVALID 或
-		// ERR_SSL_VERSION_OR_CIPHER_MISMATCH。直接关连接，让客户端按 Happy Eyeballs 回落 IPv4；
-		// CF 站点若是 IPv6 被拦，IPv4 那一路会正常走"直连被拦 → PYIP"。
+		// 第二道守卫：IPv6 目标一律不送 PYIP。ProxyIP 是 IPv4 中继，IPv6 目标过去只会拿到它自己的
+		// 证书；即使 Workers 对 IPv6 出站直接报"地址不允许"，也不该把它当中继目标。关连接让客户端
+		// 回落 IPv4；若那个站点是 IPv6 的 CF 站点，IPv4 那一路仍会走"直连被拦 → PYIP"。
 		if (headerInfo?.addressType === ADDR_TYPE_IPV6) {
 			log(`retry skipped: IPv6 target ${headerInfo?.addressRemote} cannot use IPv4-only proxyip`);
 			safeCloseWebSocket(ws);
@@ -547,8 +556,14 @@ async function handleTCPOutBound(headerInfo, io) {
 		const guard = makeDownlinkGuard();
 		relayDownlink(tcp, ws, retry, log, guard, firstDownlinkOf(guard));
 	} catch (err) {
-		// 直连 TCP 握手失败（SYN 被封锁等），直接走代理重试
-		log(`direct connect failed: ${err.message}, retrying via proxy`);
+		if (!shouldRetryViaProxy(err)) {
+			// 不是"被拦截/不可达"这类失败：走 ProxyIP 只会拿到它的证书，直接关连接，
+			// 让客户端自己换路（浏览器会按 Happy Eyeballs 回落 IPv4）。
+			log(`direct connect failed: ${err?.message}, proxyip retry skipped`);
+			safeCloseWebSocket(ws);
+			return;
+		}
+		log(`direct connect failed: ${err?.message}, retrying via proxy`);
 		await retry();
 	}
 }
